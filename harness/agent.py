@@ -109,6 +109,7 @@ from dataclasses import dataclass, field
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
+    RealModel,
     TOOL_ERROR_PREFIX,
     parse_output,
 )
@@ -480,7 +481,13 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
-        self.system_prompt = system_prompt
+        # Use the supplied real-model protocol on both direct and scored clients.
+        client = getattr(model, "inner", model)
+        self.system_prompt = (
+            ARENA_SYSTEM_PROMPT_REAL
+            if isinstance(client, RealModel) and system_prompt == ARENA_SYSTEM_PROMPT
+            else system_prompt
+        )
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which
@@ -652,7 +659,20 @@ class ReActAgent:
             # protocol needs to be told, and the mock never gets here.
             return (
                 f"{TOOL_ERROR_PREFIX} không đọc được ACTION. Hãy trả lời đúng định dạng "
-                "THOUGHT/ACTION hoặc THOUGHT/FINAL."
+                'một dòng: ACTION: {"tool": "search", "args": {"query": "từ khóa", "k": 5}}. '
+                'Thay từ khóa bằng truy vấn của bạn. Không dùng {"search": ...}. '
+                'Với fetch_doc, dùng ACTION: {"tool": "fetch_doc", "args": '
+                '{"doc_id": "mã tài liệu đã thấy"}}. '
+                'Kết luận dùng FINAL: rồi một đối tượng JSON trên cùng dòng.'
+            )
+
+        required = {"search": "query", "fetch_doc": "doc_id", "calc": "expression"}.get(parsed.tool)
+        if required and not _as_text(parsed.args.get(required)).strip():
+            return (
+                f"{TOOL_ERROR_PREFIX} ACTION thiếu args.{required}. "
+                f'Viết lại ACTION với "tool": "{parsed.tool}" và "args" là đối tượng '
+                f'chứa "{required}". Tham số phải nằm BÊN TRONG args, không nằm cạnh tool. '
+                "Không có công cụ nào được gọi; ngân sách chưa bị tiêu."
             )
 
         call = self.middleware.wrap_tool_call(ctx, self._dispatch)

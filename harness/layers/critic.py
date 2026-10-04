@@ -70,6 +70,11 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import json
+import re
+
+from arena.model import RealModel, parse_output
+
 from harness.middleware import Middleware
 
 
@@ -78,17 +83,77 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def wrap_model_call(self, ctx, call, messages):
+        response = call(messages)
+        model = getattr(ctx, "model", None)
+        if not isinstance(getattr(model, "inner", model), RealModel) or ctx.state.get("quote_repair"):
+            return response
+        parsed = parse_output(response.text)
+        if parsed.kind != "final" or not isinstance(parsed.final, dict):
+            return response
+        claims = parsed.final.get("claims")
+        if not isinstance(claims, list):
+            return response
+        lines = []
+        for claim in claims:
+            if (not isinstance(claim, dict) or not isinstance(claim.get("text"), str)
+                    or not isinstance(claim.get("doc_id"), str)):
+                continue
+            text = claim["text"]
+            doc = ctx.corpus.get(claim.get("doc_id")) if ctx.corpus else None
+            if not text or doc is None or doc.body not in ctx.observed_text:
+                continue
+            lines.extend(line for line in doc.body.splitlines()
+                         if text in line and len(text) < len(line) <= 400)
+        if not lines:
+            return response
+        ctx.state["quote_repair"] = True
+        return call(messages + [
+            {"role": "assistant", "content": response.text},
+            {"role": "user", "content": (
+                "Câu trả lời đã trích thiếu phần còn lại của dòng bằng chứng. "
+                "Hãy xuất lại FINAL, giữ nguyên kết luận và mã tài liệu, nhưng "
+                "chép NGUYÊN toàn bộ dòng tương ứng dưới đây vào claims.text. "
+                "Đây là nguyên văn từ tài liệu bạn đã fetch, không phải dữ kiện mới: "
+                + json.dumps(lines, ensure_ascii=False)
+            )},
+        ])
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+        kept, conflicted = [], False
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            # Include overlapping joins, such as "... và và ...".
+            for match in re.finditer(r"(?= và )", text):
+                index = match.start()
+                halves = (text[:index], text[index + len(" và "):])
+                if not all(ctx.saw(half) for half in halves):
+                    continue
+                sources = [next((doc for doc in getattr(ctx.corpus, "docs", [])
+                                 if doc.body in ctx.observed_text
+                                 and any(half in line for line in doc.body.splitlines())), None)
+                           for half in halves]
+                if all(sources) and sources[0].doc_id != sources[1].doc_id:
+                    kept.extend({**claim, "text": half, "doc_id": doc.doc_id}
+                                for half, doc in zip(halves, sources))
+                    conflicted = True
+                    break
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept
+                                      if isinstance(c.get("doc_id"), str) and c["doc_id"]})
+        if not kept or conflicted:
+            report["abstain"] = True
+            report["answer"] = (
+                "Không đủ căn cứ để trả lời." if not kept else
+                "Các nguồn chưa thống nhất; chưa thể kết luận. "
+                + " ".join(c["text"] for c in kept)
+            )
+        return report
